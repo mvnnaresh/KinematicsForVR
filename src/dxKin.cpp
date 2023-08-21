@@ -1,9 +1,13 @@
 #include "dxKin.h"
 
 
-dxKin::dxKin() : fksolver(nullptr), iksolver1v(nullptr), iksolver(nullptr)
+dxKin::dxKin(ChainData robotData) :
+    IK_METHOD(static_cast<IKMethod>(100)),
+    fksolver(nullptr),
+    iksolver1v(nullptr),
+    iksolver(nullptr)
 {
-    this->robot = robotdata();
+    this->robot = robotData;
 
     this->low = this->robot.q_min;
     this->high = this->robot.q_max;
@@ -37,13 +41,12 @@ dxKin::dxKin() : fksolver(nullptr), iksolver1v(nullptr), iksolver(nullptr)
 
     //---- Kinematic solvers of KDL
     fksolver = new KDL::ChainFkSolverPos_recursive(this->robot.chain);
-    //iksolver1v = new KDL::ChainIkSolverVel_pinv_nso(this->robot.chain, 0.0001, 1000, 0.25);
     iksolver1v = new KDL::ChainIkSolverVel_pinv(this->robot.chain);
     iksolver = new KDL::ChainIkSolverPos_NR_JL(this->robot.chain, q_min, q_max, *fksolver, *iksolver1v, 1000, 1e-4);
 
 }
 
-std::vector<double> dxKin::getJointCommand(std::vector<double> qcurr, vpHomogeneousMatrix H)
+std::vector<double> dxKin::getInverseConfiguration(std::vector<double> qcurr, vpHomogeneousMatrix H)
 {
     if (IK_METHOD == IKMethod::KDL_PINV_IK)
     {
@@ -53,11 +56,20 @@ std::vector<double> dxKin::getJointCommand(std::vector<double> qcurr, vpHomogene
     {
         return this->ikSolverNSO(H, qcurr);
     }
+    if (IK_METHOD == IKMethod::DLS_NSO)
+    {
+        return this->ikSolverDLSNSO(H, qcurr);
+    }
     else
     {
         std::cerr << " Invalid IK method. Returning seed!!" << std::endl;
         return qcurr;
     }
+}
+
+void dxKin::setIKMethod(IKMethod method)
+{
+    this->IK_METHOD = method;
 }
 
 //------------------------------------------------------------
@@ -79,6 +91,7 @@ void dxKin::setJointPos(std::vector<double> pos)
         (*q)(i) = RADIANS(pos[i]);
     }
 }
+
 //------------------------------------------------------------
 //					JACOBIAN MATRIX
 //------------------------------------------------------------
@@ -178,44 +191,112 @@ std::vector <double> dxKin::ikSolverKDL(vpHomogeneousMatrix cartPos, std::vector
 std::vector <double> dxKin::ikSolverNSO(vpHomogeneousMatrix cartPos, std::vector<double> seed)
 {
     vpMatrix JPInv;
-    int numDOF = this->numJoints;
-    double tolerance = 1e-6;		// Tolerance for convergence
-    int maxIterations = 1000;		// Maximum number of iterations to avoid infinite loops
-
-    int iterations = 0;
-
     vpColVector q_curr = seed;
 
-    bool isFirstIteration = true;
+    int numDOF = this->numJoints;
+    int iterations = 0;
+    int maxIterations = 1000;		// Maximum number of iterations to avoid infinite loops
 
-    int NDoF = this->robot.chain.getNrOfJoints();
-    std::vector<double> q_prev(NDoF, 0);
+    double tolerance = 1e-5;		// Tolerance for convergence
     double manipulabilityPrev = 0;
     double manipulabilityGain = 1.2;
-    std::vector<double> NSq0_des(NDoF, 0);
-    std::vector<double> NSq0_dot(NDoF, 0);
+
+    std::vector<double> q_prev(numDOF, 0);
+    std::vector<double> NSq0_des(numDOF, 0);
+    std::vector<double> NSq0_dot(numDOF, 0);
+
+    KDL::Frame targetFrame = vpHomMatToKDLFrame(cartPos);
 
     while (iterations < maxIterations)
     {
         vpHomogeneousMatrix H = this->getForwardPosition(q_curr.toStdVector());
 
+        KDL::Frame currentFrame = vpHomMatToKDLFrame(H);
 
-        vpColVector positionError = this->computePoseError(cartPos, H);
-
-        // Check for convergence
-        if (positionError.sumSquare() < tolerance)
+        if (KDL::Equal(currentFrame, targetFrame, tolerance))
         {
             break;
         }
 
+        vpColVector positionError = this->computePoseError(cartPos, H);
+
         //Nullspace control
         double manipulability = this->getManipulability(q_curr.toStdVector());
-
 
         if (iterations > 0)
         {
             // Applying secondary objective for maximising the manipulability Eq.3.56
-            for (int i = 0; i < NDoF; i++)
+            for (int i = 0; i < numDOF; i++)
+            {
+                //Computing the delta of join pose for Eq.3.55
+                double dq = (RADIANS(q_curr[i] - q_prev[i]));
+                if (fabs(dq) < 1e-6)
+                {
+                    NSq0_dot[i] = 0;
+                    continue;
+                }
+                //Needs to be multiplied by dt because of the integration
+                NSq0_dot[i] = manipulabilityGain * (manipulability - manipulabilityPrev) / dq;
+            }
+        }
+
+        //Get the nullspace command
+        std::vector<double> qcmd = this->getPositionWithNullSpaceAndDLS(positionError.toStdVector(), q_curr.toStdVector(), NSq0_dot);
+
+        q_curr += vpColVector(qcmd);
+
+        q_prev = q_curr.toStdVector();
+        manipulabilityPrev = manipulability;
+
+        iterations++;
+    }
+    if (iterations >= maxIterations)
+    {
+        std::cout << "KDL IK solver FAILED - No solution found. Returning seed configuration!!" << std::endl;
+    }
+
+    return q_curr.toStdVector();
+}
+
+std::vector <double> dxKin::ikSolverDLSNSO(vpHomogeneousMatrix cartPos, std::vector<double> seed)
+{
+    vpMatrix JPInv;
+    vpColVector q_curr = seed;
+
+    int numDOF = this->numJoints;
+    int iterations = 0;
+    int maxIterations = 1000;		// Maximum number of iterations to avoid infinite loops
+
+    double tolerance = 1e-5;		// Tolerance for convergence
+    double manipulabilityPrev = 0;
+    double manipulabilityGain = 1.2;
+
+    std::vector<double> q_prev(numDOF, 0);
+    std::vector<double> NSq0_des(numDOF, 0);
+    std::vector<double> NSq0_dot(numDOF, 0);
+
+    KDL::Frame targetFrame = vpHomMatToKDLFrame(cartPos);
+
+    while (iterations < maxIterations)
+    {
+        vpHomogeneousMatrix H = this->getForwardPosition(q_curr.toStdVector());
+
+        KDL::Frame currentFrame = vpHomMatToKDLFrame(H);
+
+        if (KDL::Equal(currentFrame, targetFrame, tolerance))
+        {
+            break;
+        }
+
+        vpColVector positionError = this->computePoseError(cartPos, H);
+
+        //Nullspace control
+        double manipulability = this->getManipulability(q_curr.toStdVector());
+
+        if (iterations > 0)
+        {
+            // Applying secondary objective for maximising the manipulability Eq.3.56
+            for (int i = 0; i < numDOF; i++)
             {
                 //Computing the delta of join pose for Eq.3.55
                 double dq = (RADIANS(q_curr[i] - q_prev[i]));
@@ -232,14 +313,10 @@ std::vector <double> dxKin::ikSolverNSO(vpHomogeneousMatrix cartPos, std::vector
         //Get the nullspace command
         std::vector<double> qcmd = this->getPositionWithNullSpace(positionError.toStdVector(), q_curr.toStdVector(), NSq0_dot);
 
-        vpColVector tmp = qcmd;
-        q_curr += tmp;
+        q_curr += vpColVector(qcmd);
 
         q_prev = q_curr.toStdVector();
         manipulabilityPrev = manipulability;
-
-        if (isFirstIteration)
-            isFirstIteration = false;
 
         iterations++;
     }
